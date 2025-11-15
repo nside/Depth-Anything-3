@@ -456,19 +456,28 @@ def _compute_alignment_transform_first_cam_glTF_center_by_points(
     M[2, 2] = -1.0  # flip Z
 
     # Ground plane alignment (optional)
-    R_ground = np.eye(4, dtype=np.float64)
+    use_ground_alignment = False
     if align_to_ground and points_world.shape[0] > 0:
         ground_normal, _ = _detect_ground_plane_ransac(points_world)
         if ground_normal is not None:
-            # Compute rotation to align ground normal to Y-up in world coordinates
+            # Compute rotation to align ground normal to Y-up
             R_ground_3x3 = _compute_ground_alignment_rotation(ground_normal)
+            R_ground = np.eye(4, dtype=np.float64)
             R_ground[:3, :3] = R_ground_3x3
-            logger.info(f"Ground plane alignment enabled. Rotation matrix computed.")
+
+            # When using ground alignment, only apply:
+            # 1. Ground rotation (align ground plane to XZ plane)
+            # 2. CV->glTF axis flip
+            # We skip w2c0 to avoid re-introducing tilt from the first camera
+            A_no_center = M @ R_ground
+            use_ground_alignment = True
+            logger.info(f"Ground plane alignment enabled. Scene aligned to detected ground plane.")
         else:
             logger.warning("Ground plane detection failed. Falling back to first camera orientation.")
 
-    # Apply transformations: first ground alignment, then first camera orientation, then CV->glTF
-    A_no_center = M @ w2c0 @ R_ground
+    # Fallback: use first camera orientation (old behavior)
+    if not use_ground_alignment:
+        A_no_center = M @ w2c0
 
     # Calculate point cloud center in new coordinate system (use median to resist outliers)
     if points_world.shape[0] > 0:
