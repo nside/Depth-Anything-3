@@ -378,17 +378,23 @@ def _detect_ground_plane_ransac(
     return best_normal, centroid
 
 
-def _compute_ground_alignment_rotation(ground_normal: np.ndarray) -> np.ndarray:
+def _compute_ground_alignment_rotation(ground_normal: np.ndarray, apply_cv_flip: bool = False) -> np.ndarray:
     """Compute rotation matrix to align ground plane normal to Y-up.
 
     Args:
         ground_normal: (3,) unit normal vector pointing up from ground
+        apply_cv_flip: If True, align to [0,-1,0] to account for CV->glTF Y-flip
 
     Returns:
-        R: (3, 3) rotation matrix such that R @ ground_normal ≈ [0, 1, 0]
+        R: (3, 3) rotation matrix such that R @ ground_normal ≈ target
     """
-    # Target direction: Y-up in glTF coordinates
-    target = np.array([0.0, 1.0, 0.0])
+    # Target direction depends on whether we'll apply CV->glTF flip afterward
+    if apply_cv_flip:
+        # Align to -Y so that after M flips it, it becomes +Y
+        target = np.array([0.0, -1.0, 0.0])
+    else:
+        # Align directly to +Y (glTF up)
+        target = np.array([0.0, 1.0, 0.0])
 
     # Normalize input (should already be normalized, but ensure it)
     ground_normal = ground_normal / np.linalg.norm(ground_normal)
@@ -465,14 +471,14 @@ def _compute_alignment_transform_first_cam_glTF_center_by_points(
     if align_to_ground and points_world.shape[0] > 0:
         ground_normal, _ = _detect_ground_plane_ransac(points_world)
         if ground_normal is not None:
-            # Compute rotation to align ground normal to Y-up
-            R_ground_3x3 = _compute_ground_alignment_rotation(ground_normal)
+            # Compute rotation to align ground normal, accounting for CV->glTF flip
+            R_ground_3x3 = _compute_ground_alignment_rotation(ground_normal, apply_cv_flip=True)
             R_ground = np.eye(4, dtype=np.float64)
             R_ground[:3, :3] = R_ground_3x3
 
-            # When using ground alignment, only apply:
-            # 1. Ground rotation (align ground plane to XZ plane)
-            # 2. CV->glTF axis flip
+            # When using ground alignment:
+            # 1. R_ground aligns to -Y (so ground normal points down in world coords)
+            # 2. M flips Y and Z, making -Y become +Y (up in glTF)
             # We skip w2c0 to avoid re-introducing tilt from the first camera
             A_no_center = M @ R_ground
             use_ground_alignment = True
