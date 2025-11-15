@@ -62,6 +62,7 @@ def export_to_glb(
     show_cameras: bool = True,
     camera_size: float = 0.03,
     export_depth_vis: bool = True,
+    align_to_ground: bool = True,
 ) -> str:
     """Generate a 3D point cloud and camera wireframes and export them as a ``.glb`` file.
 
@@ -84,6 +85,9 @@ def export_to_glb(
         show_cameras: Whether to render camera wireframes in the exported scene.
         camera_size: Relative camera wireframe scale as a fraction of the scene diagonal.
         export_depth_vis: Whether to export raster depth visualisations alongside the glTF.
+        align_to_ground: Whether to auto-detect and align the scene to the ground plane (Y=0).
+            If True, uses RANSAC to detect the dominant plane and rotates the scene so it's level.
+            If False, uses the first camera's orientation as the reference frame (old behavior).
 
     Returns:
         Path to the exported ``scene.glb`` file.
@@ -142,7 +146,7 @@ def export_to_glb(
     # 5) Based on first camera orientation + glTF axis system, center by point cloud,
     # construct alignment transform, and apply to point cloud
     A = _compute_alignment_transform_first_cam_glTF_center_by_points(
-        prediction.extrinsics[0], points
+        prediction.extrinsics[0], points, align_to_ground=align_to_ground
     )  # (4,4)
 
     if points.shape[0] > 0:
@@ -272,9 +276,150 @@ def _estimate_scene_scale(points: np.ndarray, fallback: float = 1.0) -> float:
     return float(diag if np.isfinite(diag) and diag > 0 else fallback)
 
 
+def _detect_ground_plane_ransac(
+    points: np.ndarray,
+    num_iterations: int = 1000,
+    distance_threshold: float = 0.05,
+    min_inliers_ratio: float = 0.1,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Detect the ground plane using RANSAC.
+
+    Args:
+        points: (N, 3) array of 3D points in world coordinates
+        num_iterations: Number of RANSAC iterations
+        distance_threshold: Maximum distance for a point to be considered an inlier (relative to scene scale)
+        min_inliers_ratio: Minimum ratio of inliers required for a valid plane
+
+    Returns:
+        normal: (3,) unit normal vector pointing up (away from ground), or None if detection failed
+        centroid: (3,) point on the plane, or None if detection failed
+    """
+    if points.shape[0] < 3:
+        return None, None
+
+    # Use adaptive distance threshold based on scene scale
+    scene_scale = _estimate_scene_scale(points, fallback=1.0)
+    distance_threshold = distance_threshold * scene_scale
+
+    best_inliers = 0
+    best_normal = None
+    best_d = None
+
+    # Sample points focusing on the lower portion of the scene (likely ground)
+    y_coords = points[:, 1]
+    lower_percentile = np.percentile(y_coords, 30)  # Bottom 30% of points
+    lower_mask = y_coords <= lower_percentile
+
+    if lower_mask.sum() >= 3:
+        candidate_points = points[lower_mask]
+    else:
+        candidate_points = points
+
+    for _ in range(num_iterations):
+        # Randomly sample 3 points
+        if candidate_points.shape[0] < 3:
+            break
+        idx = np.random.choice(candidate_points.shape[0], 3, replace=False)
+        p1, p2, p3 = candidate_points[idx]
+
+        # Compute plane equation: normal · (p - p1) = 0
+        # normal = (p2 - p1) × (p3 - p1)
+        v1 = p2 - p1
+        v2 = p3 - p1
+        normal = np.cross(v1, v2)
+
+        # Check if points are collinear
+        normal_len = np.linalg.norm(normal)
+        if normal_len < 1e-6:
+            continue
+
+        normal = normal / normal_len
+        d = -np.dot(normal, p1)
+
+        # Ensure normal points upward (positive Y component in world coordinates)
+        # We'll flip it later during alignment, but for now we want consistency
+        if normal[1] < 0:
+            normal = -normal
+            d = -d
+
+        # Count inliers
+        distances = np.abs(np.dot(points, normal) + d)
+        inliers = distances < distance_threshold
+        num_inliers = inliers.sum()
+
+        if num_inliers > best_inliers:
+            best_inliers = num_inliers
+            best_normal = normal
+            best_d = d
+
+    # Check if we found a valid plane
+    if best_normal is None or best_inliers < min_inliers_ratio * points.shape[0]:
+        logger.warning(
+            f"Ground plane detection failed. Best inliers: {best_inliers}/{points.shape[0]} "
+            f"({100*best_inliers/points.shape[0]:.1f}%, required: {100*min_inliers_ratio:.1f}%)"
+        )
+        return None, None
+
+    # Compute centroid of inlier points
+    distances = np.abs(np.dot(points, best_normal) + best_d)
+    inlier_mask = distances < distance_threshold
+    centroid = np.median(points[inlier_mask], axis=0)
+
+    logger.info(
+        f"Ground plane detected with {best_inliers}/{points.shape[0]} inliers "
+        f"({100*best_inliers/points.shape[0]:.1f}%), normal: {best_normal}"
+    )
+
+    return best_normal, centroid
+
+
+def _compute_ground_alignment_rotation(ground_normal: np.ndarray) -> np.ndarray:
+    """Compute rotation matrix to align ground plane normal to Y-up.
+
+    Args:
+        ground_normal: (3,) unit normal vector pointing up from ground
+
+    Returns:
+        R: (3, 3) rotation matrix such that R @ ground_normal ≈ [0, 1, 0]
+    """
+    # Target direction: Y-up in glTF coordinates
+    target = np.array([0.0, 1.0, 0.0])
+
+    # Normalize input (should already be normalized, but ensure it)
+    ground_normal = ground_normal / np.linalg.norm(ground_normal)
+
+    # If already aligned, return identity
+    if np.allclose(ground_normal, target):
+        return np.eye(3)
+
+    # If opposite direction, rotate 180 degrees around X axis
+    if np.allclose(ground_normal, -target):
+        return np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float64)
+
+    # Compute rotation axis: perpendicular to both vectors
+    axis = np.cross(ground_normal, target)
+    axis = axis / np.linalg.norm(axis)
+
+    # Compute rotation angle
+    cos_angle = np.dot(ground_normal, target)
+    angle = np.arccos(np.clip(cos_angle, -1.0, 1.0))
+
+    # Rodrigues' rotation formula
+    K = np.array([
+        [0, -axis[2], axis[1]],
+        [axis[2], 0, -axis[0]],
+        [-axis[1], axis[0], 0]
+    ], dtype=np.float64)
+
+    R = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+
+    return R
+
+
 def _compute_alignment_transform_first_cam_glTF_center_by_points(
     ext_w2c0: np.ndarray,
     points_world: np.ndarray,
+    align_to_ground: bool = True,
 ) -> np.ndarray:
     """Computes the transformation matrix to align the scene with glTF standards.
 
@@ -282,13 +427,21 @@ def _compute_alignment_transform_first_cam_glTF_center_by_points(
     point cloud and transforms its coordinate system from the computer vision (CV)
     standard to the glTF standard.
 
-    The transformation process involves three main steps:
-    1.  **Initial Alignment**: Orients the world coordinate system to match the
+    The transformation process involves:
+    1.  **Ground Plane Detection** (if enabled): Detect ground plane using RANSAC
+        and compute rotation to align it with Y=0 plane.
+    2.  **Initial Alignment**: Orients the world coordinate system to match the
         first camera's view (x-right, y-down, z-forward).
-    2.  **Coordinate System Conversion**: Converts the CV camera frame to the
+    3.  **Coordinate System Conversion**: Converts the CV camera frame to the
         glTF frame (x-right, y-up, z-backward) by flipping the Y and Z axes.
-    3.  **Centering**: Translates the entire scene so that the median of the
+    4.  **Centering**: Translates the entire scene so that the median of the
         point cloud becomes the new origin (0,0,0).
+
+    Args:
+        ext_w2c0: (4, 4) or (3, 4) first camera's world-to-camera extrinsic matrix
+        points_world: (N, 3) array of 3D points in world coordinates
+        align_to_ground: If True, detect and align to ground plane. If False, use
+            first camera orientation as before.
 
     Returns:
         A 4x4 homogeneous transformation matrix (torch.Tensor or np.ndarray)
@@ -302,8 +455,20 @@ def _compute_alignment_transform_first_cam_glTF_center_by_points(
     M[1, 1] = -1.0  # flip Y
     M[2, 2] = -1.0  # flip Z
 
-    # Don't center first
-    A_no_center = M @ w2c0
+    # Ground plane alignment (optional)
+    R_ground = np.eye(4, dtype=np.float64)
+    if align_to_ground and points_world.shape[0] > 0:
+        ground_normal, _ = _detect_ground_plane_ransac(points_world)
+        if ground_normal is not None:
+            # Compute rotation to align ground normal to Y-up in world coordinates
+            R_ground_3x3 = _compute_ground_alignment_rotation(ground_normal)
+            R_ground[:3, :3] = R_ground_3x3
+            logger.info(f"Ground plane alignment enabled. Rotation matrix computed.")
+        else:
+            logger.warning("Ground plane detection failed. Falling back to first camera orientation.")
+
+    # Apply transformations: first ground alignment, then first camera orientation, then CV->glTF
+    A_no_center = M @ w2c0 @ R_ground
 
     # Calculate point cloud center in new coordinate system (use median to resist outliers)
     if points_world.shape[0] > 0:
