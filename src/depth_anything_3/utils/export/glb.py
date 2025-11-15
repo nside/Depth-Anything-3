@@ -305,15 +305,9 @@ def _detect_ground_plane_ransac(
     best_normal = None
     best_d = None
 
-    # Sample points focusing on the lower portion of the scene (likely ground)
-    y_coords = points[:, 1]
-    lower_percentile = np.percentile(y_coords, 30)  # Bottom 30% of points
-    lower_mask = y_coords <= lower_percentile
-
-    if lower_mask.sum() >= 3:
-        candidate_points = points[lower_mask]
-    else:
-        candidate_points = points
+    # Sample from all points - don't assume any axis is "up" yet
+    # The ground plane is typically the largest planar surface
+    candidate_points = points
 
     for _ in range(num_iterations):
         # Randomly sample 3 points
@@ -336,12 +330,6 @@ def _detect_ground_plane_ransac(
         normal = normal / normal_len
         d = -np.dot(normal, p1)
 
-        # Ensure normal points upward (positive Y component in world coordinates)
-        # We'll flip it later during alignment, but for now we want consistency
-        if normal[1] < 0:
-            normal = -normal
-            d = -d
-
         # Count inliers
         distances = np.abs(np.dot(points, normal) + d)
         inliers = distances < distance_threshold
@@ -363,7 +351,24 @@ def _detect_ground_plane_ransac(
     # Compute centroid of inlier points
     distances = np.abs(np.dot(points, best_normal) + best_d)
     inlier_mask = distances < distance_threshold
-    centroid = np.median(points[inlier_mask], axis=0)
+    inlier_points = points[inlier_mask]
+    centroid = np.median(inlier_points, axis=0)
+
+    # Determine which direction is "up": the normal should point away from the bulk of the scene
+    # Test both directions and pick the one where more non-ground points are on the positive side
+    non_inlier_points = points[~inlier_mask]
+    if non_inlier_points.shape[0] > 0:
+        # Compute signed distances for non-inliers in both directions
+        signed_dist_pos = np.dot(non_inlier_points, best_normal) + best_d
+        signed_dist_neg = np.dot(non_inlier_points, -best_normal) - best_d
+
+        # Normal should point toward the side with more points (the scene above ground)
+        points_above_pos = (signed_dist_pos > 0).sum()
+        points_above_neg = (signed_dist_neg > 0).sum()
+
+        if points_above_neg > points_above_pos:
+            best_normal = -best_normal
+            best_d = -best_d
 
     logger.info(
         f"Ground plane detected with {best_inliers}/{points.shape[0]} inliers "
